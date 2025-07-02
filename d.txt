@@ -1,0 +1,639 @@
+root/main.go 
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+)
+
+type Event struct {
+	ID          string                 `json:"id" bson:"id"`
+	UserID      string                 `json:"userId" bson:"userId"`
+	Title       string                 `json:"title" bson:"title"`
+	Description string                 `json:"description" bson:"description"`
+	Completed   bool                   `json:"completed" bson:"completed"`
+	CreatedAt   time.Time              `json:"createdAt" bson:"createdAt"`
+	Topic       string                 `json:"topic,omitempty" bson:"topic,omitempty"`
+	Data        map[string]interface{} `json:"data,omitempty" bson:"data,omitempty"`
+	Time        time.Time              `json:"time,omitempty" bson:"time,omitempty"`
+}
+
+var (
+	Client          *mongo.Client
+	EventCollection *mongo.Collection
+	subscribers     = make(map[string][]chan Event)
+	submutex        sync.RWMutex
+
+	startTime      = time.Now()
+	requestCounter int64
+	inFlight       int64
+)
+
+func BenchmarkMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+		duration := time.Since(start)
+		atomic.AddInt64(&requestCounter, 1)
+		log.Printf("[BACKEND %s] [BENCHMARK] %s %s took %v", os.Getenv("PORT"), c.Request.Method, c.Request.URL.Path, duration)
+	}
+}
+
+func InFlightMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		atomic.AddInt64(&inFlight, 1)
+		defer atomic.AddInt64(&inFlight, -1)
+		c.Next()
+	}
+}
+
+func loadHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"in_flight": atomic.LoadInt64(&inFlight),
+	})
+}
+
+func benchmarkHandler(c *gin.Context) {
+	uptime := time.Since(startTime)
+	count := atomic.LoadInt64(&requestCounter)
+	c.JSON(http.StatusOK, gin.H{
+		"uptime":        uptime.String(),
+		"request_count": count,
+		"avg_req_per_s": float64(count) / uptime.Seconds(),
+	})
+}
+
+func createEvent(c *gin.Context) {
+	var newEvent Event
+	if err := c.ShouldBindJSON(&newEvent); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	newEvent.ID = uuid.New().String()
+	newEvent.CreatedAt = time.Now()
+	if _, err := EventCollection.InsertOne(context.TODO(), newEvent); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create event"})
+		return
+	}
+	c.JSON(http.StatusCreated, newEvent)
+}
+
+func listEvents(c *gin.Context) {
+	userID := c.Query("userId")
+	filter := bson.M{}
+	if userID != "" {
+		filter["userId"] = userID
+	}
+	cursor, err := EventCollection.Find(context.TODO(), filter)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve events"})
+		return
+	}
+	defer cursor.Close(context.TODO())
+
+	var events []Event
+	if err := cursor.All(context.TODO(), &events); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse events"})
+		return
+	}
+	c.JSON(http.StatusOK, events)
+}
+
+func getEventByID(c *gin.Context) {
+	id := c.Param("id")
+	userID := c.Query("userId")
+	filter := bson.M{"id": id}
+	if userID != "" {
+		filter["userId"] = userID
+	}
+	var event Event
+	err := EventCollection.FindOne(context.TODO(), filter).Decode(&event)
+	if err == mongo.ErrNoDocuments {
+		c.JSON(http.StatusNotFound, gin.H{"message": "event not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to retrieve the event"})
+		return
+	}
+	c.JSON(http.StatusOK, event)
+}
+
+func updateEvent(c *gin.Context) {
+	id := c.Param("id")
+	userID := c.Query("userId")
+	var updated Event
+	if err := c.ShouldBindJSON(&updated); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		return
+	}
+	filter := bson.M{"id": id}
+	if userID != "" {
+		filter["userId"] = userID
+	}
+	res, err := EventCollection.UpdateOne(
+		context.TODO(),
+		filter,
+		bson.M{"$set": bson.M{
+			"title":       updated.Title,
+			"description": updated.Description,
+			"completed":   updated.Completed,
+		}},
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to update the event"})
+		return
+	}
+	if res.MatchedCount == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"message": "event not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "event updated successfully"})
+}
+
+func deleteEvent(c *gin.Context) {
+	id := c.Param("id")
+	userID := c.Query("userId")
+	filter := bson.M{"id": id}
+	if userID != "" {
+		filter["userId"] = userID
+	}
+	res, err := EventCollection.DeleteOne(context.TODO(), filter)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete event"})
+		return
+	}
+	if res.DeletedCount == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"message": "event not found"})
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func handlePublish(c *gin.Context) {
+	var event Event
+	if err := c.BindJSON(&event); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+	if event.Topic == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Topic cannot be empty"})
+		return
+	}
+	event.ID = uuid.New().String()
+	event.Time = time.Now()
+
+	if _, err := EventCollection.InsertOne(context.TODO(), event); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save event"})
+		return
+	}
+
+	submutex.RLock()
+	count := 0
+	for _, ch := range subscribers[event.Topic] {
+		select {
+		case ch <- event:
+			count++
+		default:
+		}
+	}
+	submutex.RUnlock()
+	fmt.Printf("Published and broadcasted event on topic '%s' to %d subscribers\n", event.Topic, count)
+	c.JSON(http.StatusOK, gin.H{"status": "Event broadcasted"})
+}
+
+func handleGetEventsByTopic(c *gin.Context) {
+	topic := c.Param("topic")
+	cursor, err := EventCollection.Find(context.TODO(), bson.M{"topic": topic})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve events"})
+		return
+	}
+	defer cursor.Close(context.TODO())
+
+	var events []Event
+	if err := cursor.All(context.TODO(), &events); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse events"})
+		return
+	}
+	c.JSON(http.StatusOK, events)
+}
+
+func handleSubscribe(c *gin.Context) {
+	topic := c.Param("topic")
+	eventchan := make(chan Event, 10)
+
+	submutex.Lock()
+	subscribers[topic] = append(subscribers[topic], eventchan)
+	fmt.Printf("[Subscribe] New subscriber for topic '%s'. Total subscribers: %d\n", topic, len(subscribers[topic]))
+	submutex.Unlock()
+
+	defer func() {
+		submutex.Lock()
+		chans := subscribers[topic]
+		for i, ch := range chans {
+			if ch == eventchan {
+				subscribers[topic] = append(chans[:i], chans[i+1:]...)
+				break
+			}
+		}
+		submutex.Unlock()
+		close(eventchan)
+	}()
+
+	timeout := time.After(60 * time.Second)
+
+	c.Stream(func(w io.Writer) bool {
+		select {
+		case msg, ok := <-eventchan:
+			if ok {
+				c.SSEvent("message", msg)
+				return true
+			}
+			return false
+		case <-timeout:
+			fmt.Println("Subscription expired due to timeout.")
+			return false
+		}
+	})
+}
+
+func memStatsHandler(c *gin.Context) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	c.JSON(http.StatusOK, gin.H{
+		"alloc": m.Alloc,
+	})
+}
+
+func BackendPortLogger(port string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		log.Printf("[BACKEND %s] %s %s", port, c.Request.Method, c.Request.URL.Path)
+		c.Next()
+	}
+}
+
+func main() {
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using environment variables")
+	}
+
+	uri := os.Getenv("MONGO_URI")
+	if uri == "" {
+		log.Fatal("MONGO_URI not set or empty")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var err error
+	Client, err = mongo.Connect(ctx, options.Client().ApplyURI(uri))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	db := Client.Database("fullApp")
+	EventCollection = db.Collection("events")
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "5000"
+	}
+
+	r := gin.Default()
+	r.Use(BackendPortLogger(port))
+	r.Use(cors.Default())
+	r.Use(BenchmarkMiddleware())
+	r.Use(InFlightMiddleware())
+
+	r.GET("/load", loadHandler)
+	r.POST("/events", createEvent)
+	r.GET("/events", listEvents)
+	r.GET("/events/:id", getEventByID)
+	r.PUT("/events/:id", updateEvent)
+	r.DELETE("/events/:id", deleteEvent)
+
+	r.POST("/publish", handlePublish)
+	r.GET("/topic-events/:topic", handleGetEventsByTopic)
+	r.GET("/subscribe/:topic", handleSubscribe)
+	r.GET("/benchmark", benchmarkHandler)
+	r.GET("/memstats", memStatsHandler)
+
+	log.Printf("Backend server listening on :%s", port)
+
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: r,
+	}
+
+	serveErrors := make(chan error, 1)
+
+	go func() {
+		log.Printf("Server listening on :%s", port)
+		serveErrors <- srv.ListenAndServe()
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case err := <-serveErrors:
+		log.Fatalf("Server error: %v\n", err)
+	case sig := <-stop:
+		log.Printf("Received signal: %v - shutting down...", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("Graceful shutdown error: %v\n", err)
+		} else {
+			log.Println("Server shutdown complete")
+		}
+	}
+}
+
+root/testData/Test.Go
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+)
+const baseURL = "http://localhost:3000"
+
+type Event struct {
+	ID          string                 `json:"id"`
+	UserID      string                 `json:"userId"`
+	Title       string                 `json:"title"`
+	Description string                 `json:"description"`
+	Completed   bool                   `json:"completed"`
+	CreatedAt   time.Time              `json:"createdAt"`
+	Topic       string                 `json:"topic,omitempty"`
+	Data        map[string]interface{} `json:"data,omitempty"`
+	Time        time.Time              `json:"time,omitempty"`
+}
+
+func main() {
+	fmt.Println("Running Go test client...")
+
+	var wg sync.WaitGroup
+	numUsers := 10
+	numIterations := 50
+
+	for user := 1; user <= numUsers; user++ {
+		userID := "user" + strconv.Itoa(user)
+		wg.Add(1)
+		go func(userID string) {
+			defer wg.Done()
+			userTest(userID, numIterations)
+		}(userID)
+	}
+
+	wg.Wait()
+	fmt.Println("All users finished.")
+
+	resp, err := http.Get(baseURL + "/benchmark")
+	if err != nil {
+		fmt.Println("Error fetching benchmark:", err)
+	} else {
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		fmt.Println("Benchmark results:", string(data))
+	}
+}
+
+func userTest(userID string, iterations int) {
+	var wg sync.WaitGroup
+	for i := 0; i < iterations; i++ {
+		wg.Add(5)
+		eventTitle := fmt.Sprintf("Event %d by %s", i, userID)
+		eventDesc := fmt.Sprintf("Description %d by %s", i, userID)
+
+		go func() {
+			defer wg.Done()
+			eventID := createEvent(userID, eventTitle, eventDesc)
+			if eventID == "" {
+				return
+			}
+
+			go func() {
+				defer wg.Done()
+				updateEvent(userID, eventID)
+			}()
+
+			go func() {
+				defer wg.Done()
+				getEvent(userID, eventID)
+			}()
+
+			go func() {
+				defer wg.Done()
+				deleteEvent(userID, eventID)
+			}()
+		}()
+
+		go func() {
+			defer wg.Done()
+			listEvents(userID)
+		}()
+
+		time.Sleep(time.Duration(rand.Intn(10)) * time.Millisecond)
+	}
+	wg.Wait()
+}
+
+func createEvent(userID, title, description string) string {
+	payload := map[string]interface{}{
+		"userId":      userID,
+		"title":       title,
+		"description": description,
+		"completed":   false,
+	}
+	body, _ := json.Marshal(payload)
+
+	resp, err := http.Post(baseURL+"/events", "application/json", bytes.NewReader(body))
+	if err != nil {
+		fmt.Println("Error creating event:", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	var result Event
+	data, _ := io.ReadAll(resp.Body)
+	json.Unmarshal(data, &result)
+
+	fmt.Printf("[%s] Created event: %s\n", userID, result.ID)
+	return result.ID
+}
+
+func updateEvent(userID, id string) {
+	payload := map[string]interface{}{
+		"title":       "Updated event " + id,
+		"description": "Updated description",
+		"completed":   true,
+	}
+	body, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequest(http.MethodPut, baseURL+"/events/"+id+"?userId="+userID, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Printf("[%s] Error updating event: %v\n", userID, err)
+		return
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	fmt.Printf("[%s] Updated event: %s\n", userID, string(data))
+}
+
+func getEvent(userID, id string) {
+	resp, err := http.Get(baseURL + "/events/" + id + "?userId=" + userID)
+	if err != nil {
+		fmt.Printf("[%s] Error getting event: %v\n", userID, err)
+		return
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	fmt.Printf("[%s] Fetched event: %s\n", userID, string(data))
+}
+
+func deleteEvent(userID, id string) {
+	req, _ := http.NewRequest(http.MethodDelete, baseURL+"/events/"+id+"?userId="+userID, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Printf("[%s] Error deleting event: %v\n", userID, err)
+		return
+	}
+	defer resp.Body.Close()
+	fmt.Printf("[%s] Deleted event: %s\n", userID, id)
+}
+
+func listEvents(userID string) {
+	resp, err := http.Get(baseURL + "/events?userId=" + userID)
+	if err != nil {
+		fmt.Printf("[%s] Error listing events: %v\n", userID, err)
+		return
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	fmt.Printf("[%s] All events: %s\n", userID, string(data))
+}
+
+root/loadBalancer/balancer.go
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"sync"
+	"time"
+)
+
+type Backend struct {
+	URL        *url.URL
+	MemoryUsed uint64
+	Alive      bool
+	mu         sync.RWMutex
+}
+
+var backendAddrs = []string{
+	"http://localhost:5000",
+	"http://localhost:5001",
+	"http://localhost:5002",
+}
+
+var backends []*Backend
+
+func updateLoad(b *Backend) {
+	for {
+		resp, err := http.Get(b.URL.String() + "/load")
+		if err != nil {
+			b.mu.Lock()
+			b.Alive = false
+			b.MemoryUsed = ^uint64(0)
+			b.mu.Unlock()
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		var stats struct {
+			InFlight int64 `json:"in_flight"`
+		}
+		json.NewDecoder(resp.Body).Decode(&stats)
+		resp.Body.Close()
+		b.mu.Lock()
+		b.MemoryUsed = uint64(stats.InFlight)
+		b.Alive = true
+		b.mu.Unlock()
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func getLeastMemoryBackend() *Backend {
+	var min *Backend
+	for _, b := range backends {
+		b.mu.RLock()
+		if b.Alive && (min == nil || b.MemoryUsed < min.MemoryUsed) {
+			min = b
+		}
+		b.mu.RUnlock()
+	}
+	return min
+}
+
+func handler(w http.ResponseWriter, r *http.Request) {
+	b := getLeastMemoryBackend()
+	if b == nil {
+		http.Error(w, "No backend available", http.StatusServiceUnavailable)
+		return
+	}
+	log.Printf("[PROXY] %s %s -> backend %s (port %s)", r.Method, r.URL.Path, b.URL.String(), b.URL.Port())
+	proxy := httputil.NewSingleHostReverseProxy(b.URL)
+	proxy.ServeHTTP(w, r)
+}
+
+func main() {
+	for _, addr := range backendAddrs {
+		u, _ := url.Parse(addr)
+		b := &Backend{URL: u, Alive: true}
+		backends = append(backends, b)
+		go updateLoad(b)
+	}
+
+	http.HandleFunc("/", handler)
+	log.Println("Load balancer listening on :3000")
+	log.Fatal(http.ListenAndServe(":3000", nil))
+}
+
+
+
+these are my project files and the directories of the files are also mentioned. I just want to create a backend server that has to handle multiple request and also testing with so much request sending. 
+
+All the features and the code is finely working. now as a next step I just want to add a load balancer that can able to send the request to the port that is having the low load the server instances are running in the ports 5000, 5001, 5002. How to rectify the code. now when I runnning the request are all goes to the 5000 when I end the server then 5002 starts and the loads are going to that server. How to fix that. and also I noticed that opeining three terminals and running each server 3instances then the load balncer can able to split that to the servers. now the problem is how to run the servers. parallely 

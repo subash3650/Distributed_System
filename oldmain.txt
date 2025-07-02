@@ -1,0 +1,1114 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"go.etcd.io/bbolt"
+)
+
+type Event struct {
+	Topic string                 `json:"topic"`
+	Data  map[string]interface{} `json:"data"`
+}
+
+var (
+	eventStore  = make(map[string][]Event)
+	storeMutex  sync.RWMutex
+	subscribers = make(map[string][]chan Event)
+	submutex    sync.RWMutex
+	Db          *bbolt.DB
+)
+
+func main() {
+	r := gin.Default()
+
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			"message": "Hello, World!",
+		})
+	})
+
+	var err error
+	Db, err = bbolt.Open("events.db", 0600, nil) // <-- Correct assignment
+	if err != nil {
+		fmt.Printf("Error opening database: %v\n", err)
+		os.Exit(1)
+	}
+	defer Db.Close()
+
+	r.POST("/publish", handlePublish)
+	r.GET("/events/:topic", handleGetEvents)
+	r.GET("/subscribe/:topic", handleSubscribe)
+
+	srv := &http.Server{
+		Addr:    ":5000",
+		Handler: r,
+	}
+	serveErrors := make(chan error, 1)
+
+	go func() {
+		fmt.Println("Starting server on :5000")
+		serveErrors <- srv.ListenAndServe()
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case err := <-serveErrors:
+		fmt.Printf("Server error: %v\n", err)
+	case sig := <-stop:
+		fmt.Printf("Received signal: %v - shutting down...\n", sig)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := srv.Shutdown(ctx); err != nil {
+			fmt.Printf("Graceful shutdown error: %v\n", err)
+		} else {
+			fmt.Println("Server shutdown complete")
+		}
+		fmt.Println("All subscriber channels closed")
+	}
+}
+
+func handleSubscribe(c *gin.Context) {
+	topic := c.Param("topic")
+	eventchan := make(chan Event, 10)
+
+	submutex.Lock()
+	subscribers[topic] = append(subscribers[topic], eventchan)
+	fmt.Printf("[Subscribe] New subscriber for topic '%s'. Total subscribers: %d\n", topic, len(subscribers[topic]))
+	submutex.Unlock()
+
+	defer func() {
+		submutex.Lock()
+		chans := subscribers[topic]
+		for i, ch := range chans {
+			if ch == eventchan {
+				subscribers[topic] = append(chans[:i], chans[i+1:]...)
+				fmt.Printf("[Subscribe] Subscriber removed from topic '%s'. Remaining: %d\n", topic, len(subscribers[topic]))
+				break
+			}
+		}
+		submutex.Unlock()
+		close(eventchan)
+		fmt.Printf("[Subscribe] Channel closed for topic '%s'\n", topic)
+	}()
+
+	timeout := time.After(60 * time.Second)
+
+	c.Stream(func(w io.Writer) bool {
+		select {
+		case msg, ok := <-eventchan:
+			if ok {
+				c.SSEvent("message", msg)
+				return true
+			}
+			return false
+		case <-timeout:
+			fmt.Println("Subscription expired due to timeout.")
+			return false
+		}
+	})
+}
+
+func handleGetEvents(c *gin.Context) {
+	topic := c.Param("topic")
+	storeMutex.RLock()
+	defer storeMutex.RUnlock()
+	events, ok := eventStore[topic]
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "No events found for this topic"})
+		return
+	}
+	c.JSON(http.StatusOK, events)
+}
+
+func handlePublish(c *gin.Context) {
+	var event Event
+	if err := c.BindJSON(&event); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	if event.Topic == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Topic cannot be empty"})
+		return
+	}
+
+	storeMutex.Lock()
+	eventStore[event.Topic] = append(eventStore[event.Topic], event)
+	storeMutex.Unlock()
+
+	eventBytes, err := json.Marshal(event)
+	if err != nil {
+		fmt.Printf("Error marshaling event: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to serialize event"})
+		return
+	}
+
+	err = Db.Update(func(tx *bbolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte(event.Topic))
+		if err != nil {
+			return fmt.Errorf("create bucket: %v", err)
+		}
+		key := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
+		return bucket.Put(key, eventBytes)
+	})
+	if err != nil {
+		fmt.Printf("Error saving event to database: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save event"})
+		return
+	}
+
+	submutex.RLock()
+	count := 0
+	for _, ch := range subscribers[event.Topic] {
+		select {
+		case ch <- event:
+			count++
+		default:
+		}
+	}
+	submutex.RUnlock()
+	fmt.Printf("Published and broadcasted event on topic '%s' to %d subscribers\n", event.Topic, count)
+	c.JSON(http.StatusOK, gin.H{"status": "Event broadcasted"})
+}
+
+
+
+
+
+
+
+prompt:
+This are the files that I am working with I just want this project to achieve the things that I list here and give me the corresponding code to achive them. 
+
+There are so many users in the internet giving so many concurrent requests like create, listALlevent, listBYid, update and deleteTheevents. all the requests will be parally given by the users, generally there will be no change for a particular user gives all the request at a single time but for leaning and testing purpose we are going to have to give the requests of all the 5 will be given by parallely by all the users. Each user is assigned with a particular id and request has to be comes under this id for that particular user. there has to be 10users paralally giving all the request 50times use channels and goroutines and all the golang new feature for that this is setup for testing for Test.go file. and the server that is main.go has to create seperate goroutines for each users to handle to requests efficiently. all the request has to served at very fast time by the server using goroutines. and the request has to updated in the mongoDB database fastly. when the user is offline sometimes the subroutine data has to be cleared automatically and also the race condition has to prevented by mutex blocking of read and write , read or write request.  analyse the current code also and add the currently existing feature also with the already existing once. give me the 2 full codes with working conditions. analyse the errors and give the best output.
+
+
+
+
+test.go
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+)
+
+const baseURL = "http://localhost:5000"
+
+type Event struct {
+	ID          string                 `json:"id"`
+	Title       string                 `json:"title"`
+	Description string                 `json:"description"`
+	Completed   bool                   `json:"completed"`
+	CreatedAt   time.Time              `json:"createdAt"`
+	Topic       string                 `json:"topic,omitempty"`
+	Data        map[string]interface{} `json:"data,omitempty"`
+	Time        time.Time              `json:"time,omitempty"`
+}
+
+func main() {
+	fmt.Println("Running Go test client...")
+
+	var wg sync.WaitGroup
+	eventIDs := make([]string, 0, 20)
+	eventIDMutex := sync.Mutex{}
+
+	for i := 1; i <= 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := createEvent("event "+strconv.Itoa(i), "Generated event number "+strconv.Itoa(i))
+			if id != "" {
+				eventIDMutex.Lock()
+				eventIDs = append(eventIDs, id)
+				eventIDMutex.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+	fmt.Println("20 events created.")
+	for i := 0; i < 5 && i < len(eventIDs); i++ {
+		updateEvent(eventIDs[i])
+	}
+
+	for i := 0; i < 5 && i < len(eventIDs); i++ {
+		getEvent(eventIDs[i])
+	}
+
+	for i := 0; i < 2 && i < len(eventIDs); i++ {
+		deleteEvent(eventIDs[i])
+	}
+
+	listEvents()
+
+	publishEvent("test-topic", map[string]interface{}{
+		"message": "events created for load testing",
+		"count":   len(eventIDs),
+	})
+
+	getEvents("test-topic")
+
+	fmt.Println("Test completed.")
+}
+
+func createEvent(title, description string) string {
+	payload := map[string]interface{}{
+		"title":       title,
+		"description": description,
+		"completed":   false,
+	}
+	body, _ := json.Marshal(payload)
+
+	resp, err := http.Post(baseURL+"/events", "application/json", bytes.NewReader(body))
+	if err != nil {
+		fmt.Println("Error creating event:", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	var result Event
+	data, _ := io.ReadAll(resp.Body)
+	json.Unmarshal(data, &result)
+
+	fmt.Println("Created event:", result.ID)
+	return result.ID
+}
+
+func updateEvent(id string) {
+	payload := map[string]interface{}{
+		"title":       "Updated event " + id,
+		"description": "Updated description",
+		"completed":   true,
+	}
+	body, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequest(http.MethodPut, baseURL+"/events/"+id, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Println("Error updating event:", err)
+		return
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	fmt.Println("Updated event:", string(data))
+}
+
+func getEvent(id string) {
+	resp, err := http.Get(baseURL + "/events/" + id)
+	if err != nil {
+		fmt.Println("Error getting event:", err)
+		return
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	fmt.Println("Fetched event:", string(data))
+}
+
+func deleteEvent(id string) {
+	req, _ := http.NewRequest(http.MethodDelete, baseURL+"/events/"+id, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Println("Error deleting event:", err)
+		return
+	}
+	defer resp.Body.Close()
+	fmt.Println("Deleted event:", id)
+}
+
+func listEvents() {
+	resp, err := http.Get(baseURL + "/events")
+	if err != nil {
+		fmt.Println("Error listing events:", err)
+		return
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	fmt.Println("All events:", string(data))
+}
+
+func publishEvent(topic string, data map[string]interface{}) {
+	event := map[string]interface{}{
+		"topic": topic,
+		"data":  data,
+	}
+	body, _ := json.Marshal(event)
+
+	resp, err := http.Post(baseURL+"/publish", "application/json", bytes.NewReader(body))
+	if err != nil {
+		fmt.Println("Error publishing event:", err)
+		return
+	}
+	defer resp.Body.Close()
+	respData, _ := io.ReadAll(resp.Body)
+	fmt.Println("Event published:", string(respData))
+}
+
+func getEvents(topic string) {
+	resp, err := http.Get(baseURL + "/events/" + topic)
+	if err != nil {
+		fmt.Println("Error getting events:", err)
+		return
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	fmt.Println("Events:", string(data))
+}
+
+
+main.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+
+)
+
+type Event struct {
+	ID    string                 `json:"id" bson:"id"`
+	Topic string                 `json:"topic" bson:"topic"`
+	Data  map[string]interface{} `json:"data" bson:"data"`
+	Time  time.Time              `json:"time" bson:"time"`
+}
+
+type Task struct {
+	ID          string    `json:"id" bson:"id"`
+	Title       string    `json:"title" bson:"title"`
+	Description string    `json:"description" bson:"description"`
+	Completed   bool      `json:"completed" bson:"completed"`
+	CreatedAt   time.Time `json:"createdAt" bson:"createdAt"`
+}
+
+var (
+	Client           *mongo.Client
+	EventCollection  *mongo.Collection
+	TaskCollection   *mongo.Collection
+	subscribers      = make(map[string][]chan Event)
+	submutex         sync.RWMutex
+)
+
+func createEvent(c *gin.Context) {
+	var newTask Task
+	if err := c.ShouldBindJSON(&newTask); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	newTask.ID = uuid.New().String()
+	newTask.CreatedAt = time.Now()
+	if _, err := TaskCollection.InsertOne(context.TODO(), newTask); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create task"})
+		return
+	}
+	c.JSON(http.StatusCreated, newTask)
+}
+
+func getevent(c *gin.Context) {
+	cursor, err := TaskCollection.Find(context.TODO(), bson.M{})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve tasks"})
+		return
+	}
+	defer cursor.Close(context.TODO())
+
+	var tasks []Task
+	if err := cursor.All(context.TODO(), &tasks); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse tasks"})
+		return
+	}
+	c.JSON(http.StatusOK, tasks)
+}
+
+func getEventbyID(c *gin.Context) {
+	id := c.Param("id")
+	var task Task
+	err := TaskCollection.FindOne(context.TODO(), bson.M{"id": id}).Decode(&task)
+	if err == mongo.ErrNoDocuments {
+		c.JSON(http.StatusNotFound, gin.H{"message": "task not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to retrieve the task"})
+		return
+	}
+	c.JSON(http.StatusOK, task)
+}
+
+func updateEvent(c *gin.Context) {
+	id := c.Param("id")
+	var updated Task
+	if err := c.ShouldBindJSON(&updated); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		return
+	}
+	res, err := TaskCollection.UpdateOne(
+		context.TODO(),
+		bson.M{"id": id},
+		bson.M{"$set": bson.M{
+			"title":       updated.Title,
+			"description": updated.Description,
+			"completed":   updated.Completed,
+		}},
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to update the task"})
+		return
+	}
+	if res.MatchedCount == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"message": "task not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "task updated successfully"})
+}
+
+func deleteEvent(c *gin.Context) {
+	id := c.Param("id")
+	res, err := TaskCollection.DeleteOne(context.TODO(), bson.M{"id": id})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete task"})
+		return
+	}
+	if res.DeletedCount == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"message": "task not found"})
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func handlePublish(c *gin.Context) {
+	var event Event
+	if err := c.BindJSON(&event); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+	if event.Topic == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Topic cannot be empty"})
+		return
+	}
+	event.ID = uuid.New().String()
+	event.Time = time.Now()
+
+	if _, err := EventCollection.InsertOne(context.TODO(), event); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save event"})
+		return
+	}
+
+	submutex.RLock()
+	count := 0
+	for _, ch := range subscribers[event.Topic] {
+		select {
+		case ch <- event:
+			count++
+		default:
+		}
+	}
+	submutex.RUnlock()
+	fmt.Printf("Published and broadcasted event on topic '%s' to %d subscribers\n", event.Topic, count)
+	c.JSON(http.StatusOK, gin.H{"status": "Event broadcasted"})
+}
+
+func handleGetEvents(c *gin.Context) {
+	topic := c.Param("topic")
+	cursor, err := EventCollection.Find(context.TODO(), bson.M{"topic": topic})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve events"})
+		return
+	}
+	defer cursor.Close(context.TODO())
+
+	var events []Event
+	if err := cursor.All(context.TODO(), &events); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse events"})
+		return
+	}
+	c.JSON(http.StatusOK, events)
+}
+
+func handleSubscribe(c *gin.Context) {
+	topic := c.Param("topic")
+	eventchan := make(chan Event, 10)
+
+	submutex.Lock()
+	subscribers[topic] = append(subscribers[topic], eventchan)
+	fmt.Printf("[Subscribe] New subscriber for topic '%s'. Total subscribers: %d\n", topic, len(subscribers[topic]))
+	submutex.Unlock()
+
+	defer func() {
+		submutex.Lock()
+		chans := subscribers[topic]
+		for i, ch := range chans {
+			if ch == eventchan {
+				subscribers[topic] = append(chans[:i], chans[i+1:]...)
+				break
+			}
+		}
+		submutex.Unlock()
+		close(eventchan)
+	}()
+
+	timeout := time.After(60 * time.Second)
+
+	c.Stream(func(w io.Writer) bool {
+		select {
+		case msg, ok := <-eventchan:
+			if ok {
+				c.SSEvent("message", msg)
+				return true
+			}
+			return false
+		case <-timeout:
+			fmt.Println("Subscription expired due to timeout.")
+			return false
+		}
+	})
+}
+
+func main() {
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using environment variables")
+	}
+
+	uri := os.Getenv("MONGO_URI")
+	if uri == "" {
+		log.Fatal("MONGO_URI not set or empty")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var err error
+	Client, err = mongo.Connect(ctx, options.Client().ApplyURI(uri))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	db := Client.Database("fullApp")
+	EventCollection = db.Collection("events")
+	TaskCollection = db.Collection("tasks")
+
+	r := gin.Default()
+	r.Use(cors.Default())
+
+	r.POST("/tasks", createEvent)
+	r.GET("/tasks", getevent)
+	r.GET("/tasks/:id", getEventbyID)
+	r.PUT("/tasks/:id", updateEvent)
+	r.DELETE("/tasks/:id", deleteEvent)
+
+	r.POST("/publish", handlePublish)
+	r.GET("/events/:topic", handleGetEvents)
+	r.GET("/subscribe/:topic", handleSubscribe)
+
+	srv := &http.Server{
+		Addr:    ":5000",
+		Handler: r,
+	}
+
+	serveErrors := make(chan error, 1)
+
+	go func() {
+		log.Println("Server listening on :5000")
+		serveErrors <- srv.ListenAndServe()
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+		case err := <-serveErrors:
+			log.Fatalf("Server error: %v\n", err)
+		case sig := <-stop:
+			log.Printf("Received signal: %v - shutting down...", sig)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := srv.Shutdown(ctx); err != nil {
+				log.Printf("Graceful shutdown error: %v\n", err)
+			} else {
+				log.Println("Server shutdown complete")
+			}
+	}
+}
+
+
+
+lastMain.go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+)
+
+type Event struct {
+	ID          string                 `json:"id" bson:"id"`
+	UserID      string                 `json:"userId" bson:"userId"`
+	Title       string                 `json:"title" bson:"title"`
+	Description string                 `json:"description" bson:"description"`
+	Completed   bool                   `json:"completed" bson:"completed"`
+	CreatedAt   time.Time              `json:"createdAt" bson:"createdAt"`
+	Topic       string                 `json:"topic,omitempty" bson:"topic,omitempty"`
+	Data        map[string]interface{} `json:"data,omitempty" bson:"data,omitempty"`
+	Time        time.Time              `json:"time,omitempty" bson:"time,omitempty"`
+}
+
+var (
+	Client          *mongo.Client
+	EventCollection *mongo.Collection
+	subscribers     = make(map[string][]chan Event)
+	submutex        sync.RWMutex
+
+	startTime      = time.Now()
+	requestCounter int64
+)
+
+func BenchmarkMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+		duration := time.Since(start)
+		atomic.AddInt64(&requestCounter, 1)
+		log.Printf("[BENCHMARK] %s %s took %v", c.Request.Method, c.Request.URL.Path, duration)
+	}
+}
+
+func benchmarkHandler(c *gin.Context) {
+	uptime := time.Since(startTime)
+	count := atomic.LoadInt64(&requestCounter)
+	c.JSON(http.StatusOK, gin.H{
+		"uptime":        uptime.String(),
+		"request_count": count,
+		"avg_req_per_s": float64(count) / uptime.Seconds(),
+	})
+}
+
+func createEvent(c *gin.Context) {
+	var newEvent Event
+	if err := c.ShouldBindJSON(&newEvent); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	newEvent.ID = uuid.New().String()
+	newEvent.CreatedAt = time.Now()
+	if _, err := EventCollection.InsertOne(context.TODO(), newEvent); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create event"})
+		return
+	}
+	c.JSON(http.StatusCreated, newEvent)
+}
+
+func listEvents(c *gin.Context) {
+	userID := c.Query("userId")
+	filter := bson.M{}
+	if userID != "" {
+		filter["userId"] = userID
+	}
+	cursor, err := EventCollection.Find(context.TODO(), filter)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve events"})
+		return
+	}
+	defer cursor.Close(context.TODO())
+
+	var events []Event
+	if err := cursor.All(context.TODO(), &events); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse events"})
+		return
+	}
+	c.JSON(http.StatusOK, events)
+}
+
+func getEventByID(c *gin.Context) {
+	id := c.Param("id")
+	userID := c.Query("userId")
+	filter := bson.M{"id": id}
+	if userID != "" {
+		filter["userId"] = userID
+	}
+	var event Event
+	err := EventCollection.FindOne(context.TODO(), filter).Decode(&event)
+	if err == mongo.ErrNoDocuments {
+		c.JSON(http.StatusNotFound, gin.H{"message": "event not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to retrieve the event"})
+		return
+	}
+	c.JSON(http.StatusOK, event)
+}
+
+func updateEvent(c *gin.Context) {
+	id := c.Param("id")
+	userID := c.Query("userId")
+	var updated Event
+	if err := c.ShouldBindJSON(&updated); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		return
+	}
+	filter := bson.M{"id": id}
+	if userID != "" {
+		filter["userId"] = userID
+	}
+	res, err := EventCollection.UpdateOne(
+		context.TODO(),
+		filter,
+		bson.M{"$set": bson.M{
+			"title":       updated.Title,
+			"description": updated.Description,
+			"completed":   updated.Completed,
+		}},
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "failed to update the event"})
+		return
+	}
+	if res.MatchedCount == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"message": "event not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "event updated successfully"})
+}
+
+func deleteEvent(c *gin.Context) {
+	id := c.Param("id")
+	userID := c.Query("userId")
+	filter := bson.M{"id": id}
+	if userID != "" {
+		filter["userId"] = userID
+	}
+	res, err := EventCollection.DeleteOne(context.TODO(), filter)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete event"})
+		return
+	}
+	if res.DeletedCount == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"message": "event not found"})
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func handlePublish(c *gin.Context) {
+	var event Event
+	if err := c.BindJSON(&event); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+	if event.Topic == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Topic cannot be empty"})
+		return
+	}
+	event.ID = uuid.New().String()
+	event.Time = time.Now()
+
+	if _, err := EventCollection.InsertOne(context.TODO(), event); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save event"})
+		return
+	}
+
+	submutex.RLock()
+	count := 0
+	for _, ch := range subscribers[event.Topic] {
+		select {
+		case ch <- event:
+			count++
+		default:
+		}
+	}
+	submutex.RUnlock()
+	fmt.Printf("Published and broadcasted event on topic '%s' to %d subscribers\n", event.Topic, count)
+	c.JSON(http.StatusOK, gin.H{"status": "Event broadcasted"})
+}
+
+func handleGetEventsByTopic(c *gin.Context) {
+	topic := c.Param("topic")
+	cursor, err := EventCollection.Find(context.TODO(), bson.M{"topic": topic})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve events"})
+		return
+	}
+	defer cursor.Close(context.TODO())
+
+	var events []Event
+	if err := cursor.All(context.TODO(), &events); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse events"})
+		return
+	}
+	c.JSON(http.StatusOK, events)
+}
+
+func handleSubscribe(c *gin.Context) {
+	topic := c.Param("topic")
+	eventchan := make(chan Event, 10)
+
+	submutex.Lock()
+	subscribers[topic] = append(subscribers[topic], eventchan)
+	fmt.Printf("[Subscribe] New subscriber for topic '%s'. Total subscribers: %d\n", topic, len(subscribers[topic]))
+	submutex.Unlock()
+
+	defer func() {
+		submutex.Lock()
+		chans := subscribers[topic]
+		for i, ch := range chans {
+			if ch == eventchan {
+				subscribers[topic] = append(chans[:i], chans[i+1:]...)
+				break
+			}
+		}
+		submutex.Unlock()
+		close(eventchan)
+	}()
+
+	timeout := time.After(60 * time.Second)
+
+	c.Stream(func(w io.Writer) bool {
+		select {
+		case msg, ok := <-eventchan:
+			if ok {
+				c.SSEvent("message", msg)
+				return true
+			}
+			return false
+		case <-timeout:
+			fmt.Println("Subscription expired due to timeout.")
+			return false
+		}
+	})
+}
+
+func memStatsHandler(c *gin.Context) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	c.JSON(http.StatusOK, gin.H{
+		"alloc": m.Alloc,
+	})
+}
+
+func BackendPortLogger(port string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		log.Printf("[BACKEND %s] %s %s", port, c.Request.Method, c.Request.URL.Path)
+		c.Next()
+	}
+}
+
+func main() {
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using environment variables")
+	}
+
+	uri := os.Getenv("MONGO_URI")
+	if uri == "" {
+		log.Fatal("MONGO_URI not set or empty")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var err error
+	Client, err = mongo.Connect(ctx, options.Client().ApplyURI(uri))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	db := Client.Database("fullApp")
+	EventCollection = db.Collection("events")
+
+	// Get port from environment variable (default 5000)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "5000"
+	}
+
+	r := gin.Default()
+	r.Use(BackendPortLogger(port))
+	r.Use(cors.Default())
+	r.Use(BenchmarkMiddleware())
+
+	r.POST("/events", createEvent)
+	r.GET("/events", listEvents)
+	r.GET("/events/:id", getEventByID)
+	r.PUT("/events/:id", updateEvent)
+	r.DELETE("/events/:id", deleteEvent)
+
+	r.POST("/publish", handlePublish)
+	r.GET("/topic-events/:topic", handleGetEventsByTopic)
+	r.GET("/subscribe/:topic", handleSubscribe)
+	r.GET("/benchmark", benchmarkHandler)
+	r.GET("/memstats", memStatsHandler)
+
+	log.Printf("Backend server listening on :%s", port)
+
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: r,
+	}
+
+	serveErrors := make(chan error, 1)
+
+	go func() {
+		log.Printf("Server listening on :%s", port)
+		serveErrors <- srv.ListenAndServe()
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case err := <-serveErrors:
+		log.Fatalf("Server error: %v\n", err)
+	case sig := <-stop:
+		log.Printf("Received signal: %v - shutting down...", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("Graceful shutdown error: %v\n", err)
+		} else {
+			log.Println("Server shutdown complete")
+		}
+	}
+}
+
+
+
+balancer.go
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"sync"
+	"time"
+)
+
+type Backend struct {
+	URL        *url.URL
+	MemoryUsed uint64
+	Alive      bool
+	mu         sync.RWMutex
+}
+
+var backendAddrs = []string{
+	"http://localhost:5000",
+	"http://localhost:5001",
+	"http://localhost:5002",
+}
+
+var backends []*Backend
+
+func updateLoad(b *Backend) {
+	for {
+		resp, err := http.Get(b.URL.String() + "/load")
+		if err != nil {
+			b.mu.Lock()
+			b.Alive = false
+			b.MemoryUsed = ^uint64(0)
+			b.mu.Unlock()
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		var stats struct{ InFlight int64 `json:"in_flight"` }
+		json.NewDecoder(resp.Body).Decode(&stats)
+		resp.Body.Close()
+		b.mu.Lock()
+		b.MemoryUsed = uint64(stats.InFlight)
+		b.Alive = true
+		b.mu.Unlock()
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func getLeastMemoryBackend() *Backend {
+	var min *Backend
+	for _, b := range backends {
+		b.mu.RLock()
+		if b.Alive && (min == nil || b.MemoryUsed < min.MemoryUsed) {
+			min = b
+		}
+		b.mu.RUnlock()
+	}
+	return min
+}
+
+func handler(w http.ResponseWriter, r *http.Request) {
+	b := getLeastMemoryBackend()
+	if b == nil {
+		http.Error(w, "No backend available", http.StatusServiceUnavailable)
+		return
+	}
+	log.Printf("[PROXY] %s %s -> backend %s (port %s)", r.Method, r.URL.Path, b.URL.String(), b.URL.Port())
+	proxy := httputil.NewSingleHostReverseProxy(b.URL)
+	proxy.ServeHTTP(w, r)
+}
+
+func main() {
+	for _, addr := range backendAddrs {
+		u, _ := url.Parse(addr)
+		b := &Backend{URL: u, Alive: true}
+		backends = append(backends, b)
+		go updateLoad(b)
+	}
+
+	http.HandleFunc("/", handler)
+	log.Println("Load balancer listening on :3000")
+	log.Fatal(http.ListenAndServe(":3000", nil))
+}
