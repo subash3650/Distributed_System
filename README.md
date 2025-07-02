@@ -1,5 +1,5 @@
 ✨ Distributed Event-Driven Task Management System in Go
-This project is a scalable, event-driven backend platform built in Go, designed to demonstrate modern concurrency patterns, clean REST APIs, and horizontal scalability with a custom load balancer.
+This project is a scalable, event-driven backend platform built in Go, designed to demonstrate modern concurrency patterns, clean REST APIs, and horizontal scalability with a custom load balancer. 
 
 🛠 Features
 1. Task Management API
